@@ -66,14 +66,14 @@ def load_model_config(model_name):
     return None
 
 
-def call_ollama(model, prompt, max_time=300):
+def call_ollama(model, prompt, max_time=300, temperature=0.7):
     """Call Ollama API and return the response dict, or None on failure."""
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "format": "json",
         "stream": False,
-        "options": {"temperature": 0.7},
+        "options": {"temperature": temperature},
     }
     try:
         proc = subprocess.run(

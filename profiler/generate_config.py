@@ -99,8 +99,11 @@ def remove_duplicate_configs(model_name):
             p.unlink()
 
 
-def profile_model(model_name, max_time=300):
+def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0):
     """Profile a model against all test cases and generate its config."""
+    config_dir = pathlib.Path(output_dir) if output_dir else CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"\n{'='*60}")
     print(f"Profiling model: {model_name}")
     print(f"{'='*60}")
@@ -114,7 +117,7 @@ def profile_model(model_name, max_time=300):
         last_error = None
         raw_content = None
         for attempt in range(3):
-            resp = call_ollama(model_name, tc["prompt"], max_time)
+            resp = call_ollama(model_name, tc["prompt"], max_time, temperature=temperature)
             if resp is None:
                 last_error = "curl failed"
                 time.sleep(5)
@@ -127,7 +130,14 @@ def profile_model(model_name, max_time=300):
             time.sleep(5)
 
         if not raw_content:
-            print(f"FAILED ({last_error})")
+            print(f"--- {tc['name']} (0 bytes) ---")
+            print("raw = ''")
+            print()
+            print("jq: echo '' | jq '.tool_calls'")
+            print(f"Error: {last_error}")
+            print("HINT: model returned empty response — too small or doesn't understand tool calling")
+            print("STATUS: FAIL")
+            print()
             results.append({
                 "name": tc["name"],
                 "raw_length": 0,
@@ -145,17 +155,57 @@ def profile_model(model_name, max_time=300):
             })
             continue
 
-        print(f"({len(raw_content)} bytes)", end=" ", flush=True)
         analysis = run_test_case(tc, raw_content)
         analysis["_raw"] = raw_content
         results.append(analysis)
 
-        if analysis["errors"]:
-            print(f"issues: {'; '.join(analysis['errors'])}")
-        elif analysis["tool_call_count"] > 0:
-            print(f"OK ({analysis['tool_call_count']} calls: {', '.join(analysis['tool_call_names'])})")
+        raw_repr = repr(raw_content[:300])
+        is_valid = analysis["valid_json"]
+        has_tc = analysis["has_tool_calls_key"]
+        tc_count = analysis["tool_call_count"]
+        tc_names = analysis["tool_call_names"]
+        errors = analysis["errors"]
+        has_fences = analysis["has_json_fences"]
+        quote_wrap = analysis.get("is_quote_wrapped")
+        top_tools = analysis.get("top_level_tools")
+
+        print(f"--- {tc['name']} ({len(raw_content)} bytes) ---")
+        print(f"raw = {raw_repr}")
+        print()
+
+        # Compiler-style parse attempt
+        if not raw_content.strip():
+            print("jq: echo '' | jq '.tool_calls'")
+            print("Error: empty response from model")
+            print("HINT: model returned nothing — too small or doesn't support tools")
+        elif not is_valid:
+            print(f"jq: echo {raw_repr} | jq '.tool_calls'")
+            print("Error: not valid JSON")
+            if has_fences:
+                print("HINT: model wrapped output in markdown fences — add 'strip_markdown_fences'")
+            if quote_wrap:
+                print("HINT: model wrapped output in quotes — add 'unwrap_json_string'")
+        elif tc_count == 0 and not has_tc:
+            print(f"jq: echo {raw_repr} | jq '.tool_calls'")
+            print("Error: JSON has no 'tool_calls' key")
+            if top_tools:
+                print(f"HINT: found tools at root level ({top_tools}) — add 'merge_top_level_keys'")
+        elif tc_count == 0:
+            print("tool_calls = []")
+            print("Error: empty tool_calls array")
         else:
-            print("no tool_calls found")
+            print(f"tool_calls = {tc_count} calls: {tc_names}")
+            for c in (analysis.get("tool_calls") or []):
+                if isinstance(c, dict) and isinstance(c.get("args"), list):
+                    print(f"  WARN: {c.get('name', '?')} args is array, not object: {c['args']}")
+
+        if errors:
+            print(f"errors: {'; '.join(errors)}")
+        if not errors and tc_count > 0:
+            print("STATUS: PASS")
+        else:
+            print("STATUS: FAIL")
+        print()
 
     # Determine needed normalizers (from FORMAT issues, not behavioral)
     normalizers = detect_needed_normalizers(results)
@@ -199,8 +249,10 @@ def profile_model(model_name, max_time=300):
         "normalizers": normalizers,
         "blocked": blocked,
     }
-    remove_duplicate_configs(model_name)
-    config_path = get_config_path(model_name)[0]
+    config_path = config_dir / f"{sanitize_model_name(model_name)}.yaml"
+    if output_dir is None:
+        remove_duplicate_configs(model_name)
+        config_path = get_config_path(model_name)[0]
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
     print(f"\n  Config written: {config_path}  (ID: {model_id or 'unknown'})")
@@ -234,6 +286,8 @@ def main():
     parser.add_argument("--model", help="Profile a specific model")
     parser.add_argument("--all", action="store_true", help="Profile all installed models")
     parser.add_argument("--list", action="store_true", help="List available models and their config status")
+    parser.add_argument("--output-dir", help="Directory to write config (default: models/)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls (default: 0.0 for deterministic profiling)")
     args = parser.parse_args()
 
     if args.list:
@@ -247,7 +301,7 @@ def main():
         return
 
     if args.model:
-        profile_model(args.model)
+        profile_model(args.model, output_dir=args.output_dir, temperature=args.temperature)
     elif args.all:
         models = list_available_models()
         # Skip base/small models that aren't useful for coding

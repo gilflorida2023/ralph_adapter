@@ -130,6 +130,7 @@ def run_test_case(test_case, raw_content):
         c.get("name") or c.get("function") or c.get("tool", "?")
         for c in calls if isinstance(c, dict)
     ]
+    result["tool_calls"] = calls
 
     # Validation
     ok, msg = test_case["validate"](calls)
