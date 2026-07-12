@@ -26,31 +26,14 @@ Before:  Ralph → inline curl + jq + Python normalization (per-model hacks in r
 After:   Ralph → adapter.py → model config → normalizers → clean JSON
 ```
 
-### jq is the diagnostic backbone
-
-`jq` is used throughout the pipeline as the shared diagnostic language for JSON inspection:
-
-- **`ralph.sh`** uses `jq` directly to wrap prompts into API payloads and extract brain model responses
-- **`profiler/generate_config.py`** prints `jq` commands for every FAIL test — telling the operator (or the brain model) exactly how to inspect the broken JSON
-- **The brain model** reads those `jq`-formatted diagnostics and decides which normalizer to apply
-
 ## Directory Map
 
 ```
 ralph-adapter/
 ├── adapter.py               # Runtime: loads model config, calls Ollama, applies normalizers
-├── prompt.md                # System prompt for Ralph meta-agent (separate from adapter)
-├── spec.md                  # Task spec for Ralph meta-agent (separate from adapter)
 ├── models/                  # Per-model YAML configs (one per model)
 ├── normalizers/             # Plugin directory — each file = one normalizer
-├── profiler/                # Automated config generator (deterministic Python)
-└── adapter_profiler/        # Meta-agent: LLM-driven autonomous profiling loop
-    ├── ralph.sh             # Orchestrator — iterates tasks via a "brain" model
-    ├── agent.py             # Task agent with 5 tools (read/write/run/mark/debrief)
-    ├── prompt.md            # System prompt for the brain model (12KB)
-    ├── test_tool_call.py    # Standalone: test one prompt's tool-calling
-    ├── workspace/           # Runtime artifacts (gitignored)
-    └── logs/                # Run logs (gitignored)
+└── profiler/                # Automated config generator (deterministic Python)
 ```
 
 ## Components
@@ -132,38 +115,6 @@ List models and their config status:
 ```bash
 python3 profiler/generate_config.py --list
 ```
-
-### `adapter_profiler/` — Autonomous profiler loop
-
-Uses a "brain" LLM (default `qwen2.5-coder:7b`) to drive the profiling loop autonomously.
-The brain model receives the spec and tool definitions, calls tools (run profiler,
-read/write config, mark task done), and iterates until all 5 tests pass or the
-model is determined to be too limited (blocked).
-
-```bash
-./adapter_profiler/ralph.sh --target <model> [--model <brain>] [--verbose]
-```
-
-Components:
-
-- **`ralph.sh`** (356 lines) — Main orchestrator. Manages a PID lock for single-instance
-  execution, calls the brain model via Ollama, parses JSON tool calls from the response,
-  executes them via `agent.py`, and feeds output back as retry context.
-  Limits: 50 task iterations, 30 attempts per task.
-
-- **`agent.py`** (259 lines) — Task sandbox. Provides 5 tools:
-  `read_file`, `write_file`, `run_command`, `mark_task`, `debrief_task`.
-  Commands are restricted to prevent modifying adapter source files.
-  Tracks task progress in `workspace/progress.md` and token usage stats.
-
-- **`test_tool_call.py`** (79 lines) — Standalone utility to test a model's
-  tool-calling ability with a single prompt. Useful for manual debugging:
-  ```bash
-  python3 test_tool_call.py <model> '<prompt>'
-  ```
-
-- **`prompt.md`** (12KB) — System prompt for the brain model. Contains the
-  device-driver metaphor, troubleshooting decision tree, and output format rules.
 
 ## Adding a new model
 
