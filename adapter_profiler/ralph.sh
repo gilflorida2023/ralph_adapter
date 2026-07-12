@@ -283,7 +283,7 @@ for c in calls:
     args = c.get('args') or c.get('parameters') or {}
     result.append({'name': name, 'args': args})
 
-ALLOWED = {'read_file', 'write_file', 'run_command', 'mark_task'}
+ALLOWED = {'read_file', 'write_file', 'run_command', 'mark_task', 'debrief_task'}
 for c in result:
     name = c['name']
     args = c['args']

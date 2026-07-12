@@ -31,25 +31,28 @@ def detect_needed_normalizers(all_results):
         needed.append("strip_markdown_fences")
 
     # Check for quote wrapping
-    if any(r.get("has_quote_wrapping") for r in all_results):
+    if any(r.get("is_quote_wrapped") for r in all_results):
         needed.append("unwrap_json_string")
 
     # Check for top-level tool keys
     if any(r.get("top_level_tools") for r in all_results):
         needed.append("merge_top_level_keys")
 
-    # Check for trailing garbage
-    trailing_garbage = False
+    # Check for trailing garbage (valid JSON prefix with extra content after)
     for r in all_results:
-        content = r["raw_preview"]
-        for test in TEST_CASES:
-            if test["name"] == r["name"]:
+        raw = r.get("_raw", "")
+        if not raw.strip():
+            continue
+        stripped = raw.strip()
+        for end in range(len(stripped), 0, -1):
+            candidate = stripped[:end]
+            try:
+                json.loads(candidate)
+                if end < len(stripped):
+                    needed.append("trim_trailing_garbage")
                 break
-        if r["valid_json"] and r.get("tool_call_count", 0) == 0:
-            # JSON parsed but no tool_calls — might have trailing garbage
-            pass
-    if trailing_garbage:
-        needed.append("trim_trailing_garbage")
+            except json.JSONDecodeError:
+                continue
 
     return list(dict.fromkeys(needed))  # unique, ordered
 
@@ -304,10 +307,7 @@ def main():
         profile_model(args.model, output_dir=args.output_dir, temperature=args.temperature)
     elif args.all:
         models = list_available_models()
-        # Skip base/small models that aren't useful for coding
-        skip_prefixes = ("qwen2.5:", "qwen3:", "qwen3.5:", "llama3.1:", "glm4:", "ornith:")
-        targets = [m for m in models if not any(m.startswith(p) for p in skip_prefixes)]
-        for model in targets:
+        for model in models:
             profile_model(model)
     else:
         parser.print_help()
