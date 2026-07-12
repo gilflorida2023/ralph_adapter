@@ -2,6 +2,8 @@
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 
@@ -10,9 +12,49 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT / "workspace"
 TASKS_JSON = WORKSPACE / "tasks.json"
 PROGRESS_PATH = WORKSPACE / "progress.md"
+SPEC_PATH = WORKSPACE / "spec_active.md"
 
 TARGET_MODEL = os.environ.get("RALPH_TARGET_MODEL", "")
 SANITIZED = TARGET_MODEL.replace("/", "_").replace(":", "_")
+
+def parse_spec():
+    with open(SPEC_PATH) as f:
+        content = f.read()
+    sections = content.split("---")
+    tasks = []
+    for section in sections:
+        m = re.search(r"### Task (\d+):\s*(.+)", section)
+        if not m:
+            continue
+        num = int(m.group(1))
+        title = m.group(2).strip()
+        func_name = ""
+        m2 = re.search(r"\*\*Action:\*\*\s*`?(\w+)", section)
+        if m2:
+            func_name = m2.group(1)
+        val_m = re.search(r"\*\*Validation:\*\*\s*(.+?)(?=---|\*\*|$)", section, re.DOTALL)
+        validation = val_m.group(1).strip() if val_m else ""
+        deps_m = re.search(r"\*\*Depends On:\*\*\s*(.+?)(?=\*\*|---|$)", section, re.DOTALL)
+        deps = []
+        if deps_m:
+            deps = [int(x.strip()) for x in re.findall(r'(\d+)', deps_m.group()) if x.strip()]
+        tasks.append({
+            "num": num, "title": title, "func": func_name,
+            "test": func_name, "validation": validation,
+            "depends_on": deps, "func_code": "", "test_code": "",
+        })
+    tasks.sort(key=lambda t: t["num"])
+    return tasks
+
+def setup():
+    os.makedirs(WORKSPACE, exist_ok=True)
+    tasks = parse_spec()
+    with open(TASKS_JSON, "w") as f:
+        json.dump(tasks, f, indent=2)
+    with open(PROGRESS_PATH, "w") as f:
+        for t in tasks:
+            f.write(f"- [TODO] Task {t['num']}: {t['title']}\n")
+    print(f"Setup: {len(tasks)} tasks for {TARGET_MODEL}")
 
 def load_tasks():
     if not TASKS_JSON.exists():
@@ -105,14 +147,15 @@ def execute_write_file(args):
 
 def execute_run_command(args):
     cmd = args.get("cmd") or args.get("command") or ""
-    blocked_paths = [
+    blocked = [
+        "rm -rf /", "rm -rf ~",
         str(PROJECT_ROOT / ".." / "adapter.py"),
         str(PROJECT_ROOT / ".." / "normalizers"),
         str(PROJECT_ROOT / ".." / "models"),
     ]
-    for p in blocked_paths:
-        if p in cmd:
-            return f"ERROR: blocked command targeting protected path: {cmd}"
+    for b in blocked:
+        if b in cmd and "rm" in cmd:
+            return f"ERROR: blocked dangerous command: {cmd}"
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
@@ -136,6 +179,9 @@ def execute_mark_task(args):
     result = update_progress_file(num, state)
     if "ERROR" in result:
         return result
+    tasks = parse_spec()
+    with open(TASKS_JSON, "w") as f:
+        json.dump(tasks, f, indent=2)
     return f"OK: Task {num} marked as {state}"
 
 def execute_debrief_task(args):
@@ -192,7 +238,9 @@ def main():
         print("Usage: agent.py <command> [args...]", file=sys.stderr)
         sys.exit(1)
     cmd = sys.argv[1]
-    if cmd == "next_task":
+    if cmd == "setup":
+        setup()
+    elif cmd == "next_task":
         next_task()
     elif cmd == "progress":
         progress()
