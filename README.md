@@ -1,13 +1,34 @@
 # Ralph Model Adapter
 
-A thin abstraction layer between [Ralph](https://github.com/anomalyco/ralph-ollama) and LLM models.
-Each model speaks a slightly different dialect of JSON tool-calling.
-Instead of patching Ralph for each model, a per-model YAML config lists
-normalizer plugins that clean up the raw Ollama response.
+Ralph is an autonomous LLM agent that profiles target models, discovers their
+tool-calling quirks, and generates adapter configs — one YAML file per model
+listing normalizer plugins that clean up the raw Ollama response.
 
-New model? Profile it. A config is generated. No Ralph code changes ever.
+The configs are written to a workspace, then promoted to `models/` in this directory
+where `adapter.py` loads them at runtime. No Ralph code changes needed for new models.
 
-## Architecture
+## Architecture (two phases)
+
+### Phase 1 — Profile (Ralph runs)
+
+```
+adapter_profiler/ralph.sh  →  profiler/generate_config.py  →  Ollama (target model)
+         │
+         ▼
+  workspace/<model>.yaml  ──promote──▶  models/<model>.yaml
+```
+
+Ralph (`adapter_profiler/ralph.sh`) uses a "brain" LLM (default `qwen2.5-coder:7b`)
+to autonomously drive the profiling loop:
+
+1. Calls `profiler/generate_config.py --model <target>` which sends 5 test prompts
+2. Reads the compiler-style output — each test shows PASS/FAIL with `jq` diagnostics
+3. Decides which normalizers to add (fences? quotes? top-level keys?)
+4. Writes/updates the YAML config in `workspace/`
+5. Re-runs the profiler to validate — iterates until all 5 tests PASS or model is blocked
+6. Config is promoted from `workspace/` to `models/`
+
+### Phase 2 — Serve (production)
 
 ```
 Ralph (unchanged)  →  adapter.py  →  Ollama (any model)
@@ -16,54 +37,53 @@ Ralph (unchanged)  →  adapter.py  →  Ollama (any model)
                     (per-model normalizer config)
 ```
 
+`adapter.py` loads the promoted config, calls Ollama, applies the listed normalizers
+to the raw response, and outputs clean `{"tool_calls": [...]}`.
+
 ### Key insight: device driver pattern
 
 Models have quirks — quote wrapping, markdown fences, misplaced `run_command` keys, trailing garbage.
 Instead of patching Ralph for each new model, each model gets a YAML config listing normalizer plugins to apply.
-
-```
-Before:  Ralph → inline curl + jq + Python normalization (per-model hacks in ralph.sh)
-After:   Ralph → adapter.py → model config → normalizers → clean JSON
-```
 
 ### jq is the diagnostic backbone
 
 `jq` is used throughout the pipeline as the shared diagnostic language for JSON inspection:
 
 - **`ralph.sh`** uses `jq` directly to wrap prompts into API payloads and extract brain model responses
-- **`profiler/generate_config.py`** prints `jq` commands for every FAIL test — telling the operator (or the brain model) exactly how to inspect the broken JSON
-- **The brain model** reads those `jq`-formatted diagnostics and decides which normalizer to apply
+- **`profiler/generate_config.py`** prints `jq` commands for every FAIL test — the brain model reads these diagnostics and decides which normalizer to apply
+- **The brain model** iterates: read `jq` output → fix config → re-run → repeat until all PASS
 
 ## Directory Map
 
 ```
 ralph-adapter/
 ├── adapter.py               # Runtime: loads model config, calls Ollama, applies normalizers
-├── models/                  # Per-model YAML configs (one per model)
+├── models/                  # Per-model YAML configs (promoted from workspace)
 ├── normalizers/             # Plugin directory — each file = one normalizer
-├── profiler/                # Automated config generator (deterministic Python)
-└── adapter_profiler/        # Ralph orchestrator — LLM-driven profiling loop
-    ├── ralph.sh             # Orchestrator loop with PID lock, retries, token tracking
+├── profiler/                # Tool: deterministic test harness (called by Ralph)
+└── adapter_profiler/        # Ralph: the autonomous agent loop
+    ├── ralph.sh             # Main loop — PID lock, retries, token tracking
     ├── agent.py             # Task agent with 5 tools (read/write/run/mark/debrief)
-    ├── prompt.md            # System prompt for the brain model (12KB)
+    ├── prompt.md            # System prompt for the brain model
     ├── test_tool_call.py    # Standalone: test one prompt's tool-calling
-    ├── workspace/           # Runtime artifacts (gitignored)
-    └── logs/                # Run logs (gitignored)
+    ├── workspace/           # Configs generated here, then promoted to ../models/
+    └── logs/                # Run logs
 ```
 
 ## Components
 
-### `adapter.py`
+### `adapter.py` — Production runtime
 
-Thin layer that:
-1. Loads `models/<model>.yaml` for the requested model
-2. Calls Ollama API with retries
-3. Applies the listed normalizer plugins to the raw response
-4. Outputs clean `{"tool_calls": [...], "prompt_tokens": N, "completion_tokens": N}`
+Loads a model config from `models/`, calls Ollama with retries, applies the listed
+normalizer plugins to the raw response, and outputs clean JSON:
 
-Usage:
 ```bash
 python3 adapter.py --model qwen2.5-coder:7b [--prompt FILE]
+```
+
+Output:
+```json
+{"tool_calls": [...], "prompt_tokens": N, "completion_tokens": N}
 ```
 
 ### `normalizers/` — Plugin directory
@@ -81,15 +101,18 @@ Auto-discovered by `normalizers/__init__.py`.
 
 ### `models/` — Per-model YAML configs
 
+Each file is generated by Ralph (in `workspace/`) and promoted here.
+`adapter.py` reads from this directory at runtime.
+
 ```yaml
-# models/qwen2.5-coder:7b.yaml
+# models/qwen2.5-coder:7b.yaml  — clean model, no normalizers needed
 model: qwen2.5-coder:7b
-normalizers: []              # clean model, nothing needed
+normalizers: []
 blocked: false
 ```
 
 ```yaml
-# models/satgeze/gemma4-12b-uncensored-1.5m:latest.yaml
+# models/satgeze/gemma4-12b-uncensored-1.5m:latest.yaml  — 4 normalizers
 model: satgeze/gemma4-12b-uncensored-1.5m:latest
 normalizers:
   - strip_markdown_fences
@@ -101,12 +124,13 @@ blocked: false
 
 Models with `blocked: true` are rejected at the adapter level — Ralph never sees their output.
 
-### `profiler/` — Automated config generator
+### `profiler/` — Test harness (called by Ralph)
 
-Sends 5 standard test prompts to a model, analyzes the raw responses, detects
-which normalizers are needed, writes `models/<model>.yaml`, and validates the result.
+A deterministic tool that sends 5 standard prompts to a model, analyzes each raw
+response, and prints compiler-style diagnostics. Ralph calls this, reads the output,
+and decides what normalizers to add.
 
-```
+```bash
 python3 profiler/generate_config.py --model qwen2.5-coder:7b
 ```
 
@@ -121,22 +145,18 @@ python3 profiler/generate_config.py --model qwen2.5-coder:7b
 **Format issues** (invalid JSON, missing tool_calls key) → model is blocked.
 **Behavioral issues** (different tool sequence) → logged as warning, not blocked.
 
-Profile all coding models:
+The profiler can also be run standalone or against all models:
+
 ```bash
-python3 profiler/generate_config.py --all
+python3 profiler/generate_config.py --all          # profile every installed model
+python3 profiler/generate_config.py --list         # list models with/without configs
+python3 profiler/generate_config.py --output-dir . # write config to current dir
 ```
 
-List models and their config status:
-```bash
-python3 profiler/generate_config.py --list
-```
+### `adapter_profiler/` — Ralph: the autonomous agent
 
-### `adapter_profiler/` — Ralph profiling orchestrator
-
-A shell-agent loop that uses a "brain" LLM (default `qwen2.5-coder:7b`) to drive the
-profiling autonomously. The brain receives the spec and tool definitions, calls tools
-(run profiler, read/write config, mark task done), and iterates until all 5 tests pass
-or the model is determined to be too limited (blocked).
+This is where Ralph lives. It's a shell-agent loop that uses a "brain" LLM to
+autonomously profile target models and generate adapter configs.
 
 ```bash
 ./adapter_profiler/ralph.sh --target <model> [--model <brain>] [--verbose]
@@ -144,26 +164,32 @@ or the model is determined to be too limited (blocked).
 
 Components:
 
-- **`ralph.sh`** — Main loop. Manages a PID lock for single-instance execution,
-  calls the brain model via Ollama, parses JSON tool calls, executes them via
-  `agent.py`, feeds output back as retry context. Limits: 50 iterations × 30 attempts.
+- **`ralph.sh`** — Main orchestrator. Manages a PID lock for single-instance
+  execution, templates the spec for the target model, calls the brain model
+  via Ollama, parses JSON tool calls from the response, executes them via
+  `agent.py`, and feeds output back as retry context. Limits: 50 iterations ×
+  30 attempts. Tracks token usage and prints a summary on exit.
 
-- **`agent.py`** — Task sandbox with 5 tools: `read_file`, `write_file`,
-  `run_command`, `mark_task`, `debrief_task`. Commands are restricted to prevent
-  modifying adapter source files. Tracks progress in `workspace/progress.md`.
+- **`agent.py`** — Task sandbox providing 5 tools: `read_file`, `write_file`,
+  `run_command`, `mark_task`, `debrief_task`. Commands are restricted to
+  prevent modifying protected paths (`adapter.py`, `normalizers/`, `models/`).
+  Tracks task progress in `workspace/progress.md`.
 
-- **`test_tool_call.py`** — Standalone: test a model's tool-calling ability with
-  a single prompt: `python3 test_tool_call.py <model> '<prompt>'`
+- **`test_tool_call.py`** — Standalone utility to test a single prompt against
+  any model. Useful for manual debugging before running the full loop:
+  ```bash
+  python3 test_tool_call.py <model> '<prompt>'
+  ```
 
-- **`prompt.md`** — System prompt for the brain model (device-driver metaphor,
-  troubleshooting decision tree, output format rules).
+- **`prompt.md`** — System prompt for the brain model. Contains the device-driver
+  metaphor, troubleshooting decision tree, tool definitions, and output format rules.
 
 ## Adding a new model
 
 1. Install via Ollama: `ollama pull new-model:tag`
-2. Profile it: `python3 profiler/generate_config.py --model new-model:tag`
-3. If blocked (format issues), review the raw output and consider a new normalizer
-4. Test: `python3 -c "from adapter import load_model_config; print(load_model_config('new-model:tag'))"`
+2. Run Ralph: `./adapter_profiler/ralph.sh --target new-model:tag`
+3. Ralph profiles the model, generates a config in `workspace/`, and promotes it to `models/`
+4. Verify: `python3 adapter.py --model new-model:tag --prompt test.txt`
 
 No changes to Ralph. No changes to the pipeline. Only a config file in `models/`.
 
@@ -181,7 +207,9 @@ YAML supports comments, cleaner for manual configs. The auto-generated configs a
 Format errors (invalid JSON, missing tool_calls) mean the pipeline can't work.
 Behavioral errors (model chose a different tool sequence) are normal variation — the model still returns valid tool_calls, just in a different order.
 
-### Why profiled configs live alongside manual ones
-The profiler writes to `models/` just like manual configs. You can edit, version, or delete them.
-The `--list` flag shows which models have configs and which don't.
+### Why configs are promoted from workspace
+Configs are generated in `adapter_profiler/workspace/` so Ralph's runtime artifacts
+are self-contained. Once a config is validated, it's promoted to `models/` where
+`adapter.py` picks it up. This keeps the production path clean and the profiling
+path isolated.
 
