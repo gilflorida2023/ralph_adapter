@@ -3,6 +3,11 @@
 Generate a model config YAML by profiling a model against test cases.
 Sends each test case prompt to the model, analyzes the raw response,
 detects which normalizers are needed, and writes the config file.
+
+Modes:
+  --model MODEL                  Live profiling (calls Ollama)
+  --model MODEL --capture FILE   Capture raw responses to FILE (no analysis)
+  --model MODEL --from-capture FILE  Replay analysis from captured FILE (no Ollama calls)
 """
 import json
 import os
@@ -102,21 +107,12 @@ def remove_duplicate_configs(model_name):
             p.unlink()
 
 
-def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0):
-    """Profile a model against all test cases and generate its config."""
-    config_dir = pathlib.Path(output_dir) if output_dir else CONFIG_DIR
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n{'='*60}")
-    print(f"Profiling model: {model_name}")
-    print(f"{'='*60}")
-
-    results = []
-
+def gather_raw_responses(model_name, max_time=300, temperature=0.0):
+    """Send each test prompt to the model, return {test_name: raw_content}."""
+    responses = {}
     for tc in TEST_CASES:
         print(f"\n  Test: {tc['name']}...", end=" ", flush=True)
 
-        # Call Ollama
         last_error = None
         raw_content = None
         for attempt in range(3):
@@ -141,6 +137,37 @@ def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0):
             print("HINT: model returned empty response — too small or doesn't understand tool calling")
             print("STATUS: FAIL")
             print()
+            responses[tc["name"]] = ""
+            continue
+
+        responses[tc["name"]] = raw_content
+
+    return responses
+
+
+def analyze_responses(model_name, responses, output_dir=None, temperature=0.0):
+    """Analyze captured raw responses and generate config."""
+    config_dir = pathlib.Path(output_dir) if output_dir else CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"Analyzing captured responses for: {model_name}")
+    print(f"{'='*60}")
+
+    results = []
+
+    for tc in TEST_CASES:
+        raw_content = responses.get(tc["name"], "")
+
+        if not raw_content:
+            print(f"--- {tc['name']} (0 bytes) ---")
+            print("raw = ''")
+            print()
+            print("jq: echo '' | jq '.tool_calls'")
+            print("Error: empty captured response")
+            print("HINT: model returned empty response — too small or doesn't understand tool calling")
+            print("STATUS: FAIL")
+            print()
             results.append({
                 "name": tc["name"],
                 "raw_length": 0,
@@ -154,7 +181,7 @@ def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0):
                 "top_level_tools": [],
                 "tool_call_count": 0,
                 "tool_call_names": [],
-                "errors": ["no response from model"],
+                "errors": ["empty captured response"],
             })
             continue
 
@@ -264,6 +291,34 @@ def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0):
     return config, results
 
 
+def profile_model(model_name, max_time=300, output_dir=None, temperature=0.0, capture=None, replay=None):
+    """Profile a model against all test cases and generate its config.
+
+    Args:
+        capture: If set, path to write captured raw responses (no analysis).
+        replay: If set, path to read captured raw responses and analyze.
+    """
+    if capture:
+        print(f"\n{'='*60}")
+        print(f"Capturing raw responses for: {model_name}")
+        print(f"{'='*60}")
+        responses = gather_raw_responses(model_name, max_time, temperature)
+        with open(capture, "w") as f:
+            json.dump(responses, f, indent=2)
+        print(f"\n  Captured {len(responses)} responses to {capture}")
+        print(f"{'='*60}\n")
+        return None, None
+
+    if replay:
+        with open(replay) as f:
+            responses = json.load(f)
+        return analyze_responses(model_name, responses, output_dir, temperature)
+
+    # Default: live profiling
+    responses = gather_raw_responses(model_name, max_time, temperature)
+    return analyze_responses(model_name, responses, output_dir, temperature)
+
+
 def list_available_models():
     """List models available via Ollama."""
     try:
@@ -291,6 +346,8 @@ def main():
     parser.add_argument("--list", action="store_true", help="List available models and their config status")
     parser.add_argument("--output-dir", help="Directory to write config (default: models/)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for model calls (default: 0.0 for deterministic profiling)")
+    parser.add_argument("--capture", help="Capture raw responses to FILE (queries model once, no analysis)")
+    parser.add_argument("--from-capture", help="Replay analysis from captured FILE (no Ollama calls)")
     args = parser.parse_args()
 
     if args.list:
@@ -304,7 +361,8 @@ def main():
         return
 
     if args.model:
-        profile_model(args.model, output_dir=args.output_dir, temperature=args.temperature)
+        profile_model(args.model, output_dir=args.output_dir, temperature=args.temperature,
+                      capture=args.capture, replay=args.from_capture)
     elif args.all:
         models = list_available_models()
         for model in models:

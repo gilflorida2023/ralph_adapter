@@ -20,6 +20,30 @@ ralph-adapter/
   models/             # production configs (READ ONLY — do not touch)
 ```
 
+## Capture-Then-Replay Workflow (TWO PHASES)
+
+This workflow avoids loading the target model repeatedly. You load it ONCE during capture, then replay the captured responses for all refinement iterations.
+
+**Phase 1 — Capture (target model loaded ONCE):**
+```
+python3 ../profiler/generate_config.py --model {target_model} --capture workspace/captured_{sanitized}.json --temperature 0
+```
+- This loads the target model, sends all 5 test prompts, saves raw responses to `workspace/captured_{sanitized}.json`.
+- After this step, the target model is NEVER loaded again.
+
+**Phase 2 — Replay Loop (NO target model calls):**
+```
+python3 ../profiler/generate_config.py --model {target_model} --from-capture workspace/captured_{sanitized}.json --output-dir workspace/
+```
+- Replays the captured responses through normalizers, prints jq diagnostics.
+- **Only the brain model (you) is active during replay.** The target model is not invoked.
+- Read the output, evaluate PASS/FAIL, update YAML if needed, re-run this same command.
+
+**RULES:**
+- After Phase 1, ALWAYS use `--from-capture` for all subsequent runs.
+- NEVER re-invoke the target model directly after the initial capture.
+- The capture file is at `workspace/captured_{sanitized}.json` — it contains all 5 raw responses keyed by test name.
+
 ## Safety Rules
 
 - **NEVER modify** `../adapter.py`, `../normalizers/`, or `../models/` 
@@ -141,92 +165,50 @@ Use this when profiling a model. The profiler sends 5 test prompts; each respons
 | 4B–9B | Passes all 5 tests reliably at temp=0.7; few or no normalizers needed |
 | >9B   | Passes all tests; may have minor formatting quirks |
 
-## How to Profile a Model
+## How to Profile a Model (Capture-Then-Replay)
 
-**Step 1 — Run the profiler:**
+**Phase 1 — Capture (target model loaded ONCE):**
 
 ```bash
-python3 ../profiler/generate_config.py --model {target_model} --output-dir workspace/ --temperature 0
+python3 ../profiler/generate_config.py --model {target_model} --capture workspace/captured_{sanitized}.json --temperature 0
 ```
 
-This sends 5 test prompts to the target model at temperature=0 and analyzes each response. Always use `--temperature 0` for deterministic results.
+This loads the target model, sends 5 test prompts at temperature=0, and saves raw responses to `workspace/captured_{sanitized}.json`. The target model is now DONE — it will not be loaded again.
 
-**Step 2 — Read the profiler output:**
+**Phase 2 — Replay Loop (NO target model calls):**
 
-The output shows each test:
-- `OK (N calls: tool1, tool2)` — the test passed
-- `FAILED (reason)` — the test failed
-- `issues: ...` — specific problems found
-
-It also shows `Validation: X/5 behavioral tests pass`.
-
-**Step 3 — Read the detailed analysis file:**
-
-The profiler saves per-test details to `workspace/{sanitized}_results.json`. Read this file. It contains for EACH test:
-
-```json
-{
-  "name": "run_pytest",
-  "raw_length": 43,
-  "raw_preview": "...first 300 chars...",
-  "raw_full": "...first 1000 chars of raw model output...",
-  "has_json_fences": false,
-  "is_quote_wrapped": false,
-  "valid_json": false,
-  "has_tool_calls_key": false,
-  "top_level_tools": [],
-  "tool_call_count": 0,
-  "tool_call_names": [],
-  "errors": ["invalid JSON"]
-}
+```bash
+python3 ../profiler/generate_config.py --model {target_model} --from-capture workspace/captured_{sanitized}.json --output-dir workspace/
 ```
 
-The `raw_full` field is the ACTUAL text the model returned. Read it to see what's wrong.
+This replays the captured responses through normalizers, prints jq diagnostics. Read the output, evaluate PASS/FAIL, update YAML if needed, re-run this same command.
 
-**Step 4 — Analyze failures with this decision tree:**
+**RULES for the replay loop:**
+- ALWAYS use `--from-capture` after the initial capture. NEVER re-invoke the target model directly.
+- The capture file is at `workspace/captured_{sanitized}.json` — contains all 5 raw responses keyed by test name.
+- The profiler prints compiler-style diagnostics (raw response, jq command, hints) for each test.
 
-```
-Are all 5 tests passing?
-  YES → Config is good. Call mark_task with state="done".
-  NO  → Read the analysis file. Check raw_full for each failing test.
+**Reading the profiler output:**
 
-Is the model returning empty content (raw_length=0)?
-  YES → Model is too small or not responding. Set blocked: true. Call mark_task.
-  NO  → Continue below.
+Each test shows:
+- `PASS` / `FAIL` status
+- `raw = <repr>` — the actual model output
+- `jq: echo <repr> | jq '.tool_calls'` — copy-paste this to inspect manually
+- `errors: ...` — specific problems found
+- `STATUS: PASS` / `FAIL`
 
-Is valid_json=False?
-  YES → Look at raw_full. What's the model actually outputting?
-         - Starts with ```json → add strip_markdown_fences
-         - Starts with " → add unwrap_json_string
-         - Any other pattern → may need a new normalizer (note: no normalizer exists for most cases)
-  NO  → Continue below.
+Summary at end:
+- `Detected normalizers: [list]`
+- `Validation: X/5 behavioral tests pass with config`
+- `Config written: workspace/{sanitized}.yaml`
 
-Is tool_call_count=0 but valid_json=True?
-  YES → Check raw_full. 
-         - Empty array → model doesn't understand tool calling. Set blocked: true.
-         - Top-level tool keys → add merge_top_level_keys
-  NO  → Continue below.
+**If some FAIL — Use the Troubleshooting Guide above to decide:**
+- Format issues (fences, quotes, top-level keys) → add normalizer to YAML
+- Empty responses or wrong tool names → model is too limited → set `blocked: true`
+- After updating YAML, re-run the replay command (step 2 above)
 
-Are tool names wrong? (e.g., "read_workspace/tasks.py" instead of "read_file")
-  YES → Model is too small to understand tool calling. Set blocked: true.
-  NO  → Continue below.
-
-Is tool_call_count < expected but > 0?
-  YES → Partial success. Check if normalizers could help. If not, model capability limit.
-
-Is tool_call_count >= expected and tool names are correct?
-  YES → Test passes! If some pass and some fail, check the failing ones above.
-```
-
-**Step 5 — Fix or accept:**
-
-- If the fix is clear (add a normalizer) → read_file the current YAML, then write_file with the normalizer added. Keep all existing fields. Re-run profiler to validate.
-- If the model is too limited (empty on complex prompts, wrong tool names) → read_file the current YAML, then write_file with `blocked: true` added. Keep `model`, `model_id`, and `normalizers` as-is. Then call mark_task.
-- If all 5 PASS → call mark_task with state="done"
-
-**Step 6 — Repeat until done:**
-
-Run the profiler, read the analysis, fix the config, re-run. You have 30 attempts. Use them.
+**If all 5 PASS:**
+Call `mark_task` with `{"num": 1, "state": "done"}`
 
 ## Tool Call Format
 
