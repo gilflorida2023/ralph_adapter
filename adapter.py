@@ -152,6 +152,17 @@ def main():
     else:
         normalizer_names = config.get("normalizers") or []
 
+    # Reject blocked / unsupported models with a clear error
+    if config and (config.get("blocked") or config.get("unsupported")):
+        reason = "unsupported" if config.get("unsupported") else "blocked"
+        print(json.dumps({
+            "tool_calls": [],
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "error": f"model {model} is {reason}: no working adapter config",
+        }), file=sys.stderr)
+        sys.exit(2)
+
     if not os.path.exists(prompt_file):
         print(json.dumps({"tool_calls": [], "prompt_tokens": 0, "completion_tokens": 0}))
         return
