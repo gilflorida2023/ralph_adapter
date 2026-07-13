@@ -1,4 +1,8 @@
+# Unsupported: this model could not emit tool calls in any form the adapter
+# could normalize during profiling. Kept as a record of the failed attempt;
+# the adapter entry is disabled for this model.
 blocked: true
+unsupported: true
 model: qwen3.5:2b
 model_id: 324d162be6ca
 normalizers: []
