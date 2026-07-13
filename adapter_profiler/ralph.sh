@@ -247,10 +247,11 @@ PY
 
         # Parse and execute tool calls — save output for retry feedback
         TOOL_OUTPUT_FILE="workspace/last_tool_output.txt"
-        python3 - "$PROMPT_RESPONSE" "$TOOL_OUTPUT_FILE" <<'PY' 2>&1 || true
+        python3 - "$PROMPT_RESPONSE" "$TOOL_OUTPUT_FILE" "$LOGFILE" <<'PY' 2>&1 || true
 import json, subprocess, sys, os
 raw = sys.argv[1] if len(sys.argv) > 1 else ""
-logfile = sys.argv[2] if len(sys.argv) > 2 else ""
+tool_logfile = sys.argv[2] if len(sys.argv) > 2 else ""
+main_logfile = sys.argv[3] if len(sys.argv) > 3 else ""
 log_lines = []
 
 raw = raw.strip().replace('```json', '').replace('```', '').strip()
@@ -261,8 +262,8 @@ except:
     msg = "PARSE ERROR: invalid JSON"
     print(msg)
     log_lines.append(msg)
-    if logfile:
-        open(logfile, 'w').write('\n'.join(log_lines))
+    if tool_logfile:
+        open(tool_logfile, 'w').write('\n'.join(log_lines))
     sys.exit(0)
 
 calls = data.get('tool_calls', [])
@@ -298,7 +299,7 @@ for c in result:
     try:
         out = subprocess.run(['python3', 'agent.py', 'execute', name, json.dumps(args)],
                              capture_output=True, text=True, timeout=900)
-        result_text = out.stdout.strip()[:500]
+        result_text = out.stdout.strip()
         print(f"  -> {result_text}")
         log_lines.append(f"  -> {result_text}")
         # If mark_task was called, note it in the log
@@ -309,8 +310,14 @@ for c in result:
     except Exception as e:
         log_lines.append(f"  -> ERROR: {e}")
 
-if logfile:
-    open(logfile, 'w').write('\n'.join(log_lines))
+# Write to tool log (for feedback to brain)
+if tool_logfile:
+    open(tool_logfile, 'w').write('\n'.join(log_lines))
+
+# Also append full output to main logfile for visibility
+if main_logfile:
+    with open(main_logfile, 'a') as f:
+        f.write('\n'.join(log_lines) + '\n')
 PY
 
         # Check if task was marked done/blocked
