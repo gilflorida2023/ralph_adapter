@@ -1,0 +1,4 @@
+model: qwen3-vl:2b
+model_id: 0635d9d857d4
+normalizers: ["strip_markdown_fences"]
+blocked: false

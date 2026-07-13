@@ -1,0 +1,5 @@
+blocked: false
+model: glm4:9b
+model_id: 5b699761eca5
+normalizers:
+- strip_markdown_fences

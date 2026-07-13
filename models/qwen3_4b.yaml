@@ -1,0 +1,4 @@
+blocked: false
+model: qwen3:4b
+model_id: 359d7dd4bcda
+normalizers: []
