@@ -6,6 +6,29 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 LOG_DIR="adapter_profiler/logs"
 BRAIN="qwen2.5-coder:7b"
 
+# Decide whether a model needs (re)profiling.
+# Prints one of: no-config | changed | same | absent
+#   no-config : no models/<sanitized>.yaml yet -> profile it
+#   changed   : config exists but the Ollama model ID differs (model was re-pulled)
+#   same      : config exists and model ID matches -> skip (already certified)
+#   absent    : model not installed locally -> keep existing config, skip
+needs_profile() {
+    local model="$1" sanitized="$2"
+    local cfg="models/$sanitized.yaml"
+    [ -f "$cfg" ] || { echo "no-config"; return; }
+    local stored
+    stored=$(grep -m1 '^model_id:' "$cfg" | awk '{print $2}')
+    local current=""
+    for _a in 1 2 3; do
+        current=$(ollama list 2>/dev/null | awk -v m="$model" '$1==m {id=$2} END {print id}')
+        [ -n "$current" ] && break
+        sleep 1
+    done
+    [ -z "$current" ] && { echo "absent"; return; }
+    [ "$current" = "$stored" ] && { echo "same"; return; }
+    echo "changed"
+}
+
 # Get all tool-capable models from Ollama
 echo "=== Discovering tool-capable Ollama models ==="
 MODEL_LIST=$(ollama list 2>/dev/null | awk 'NR>1{print $1}')
@@ -51,11 +74,13 @@ for model in "${tool_models[@]}"; do
     SANITIZED="${SANITIZED//:/_}"
     CAP="adapter_profiler/workspace/captured_${SANITIZED}.json"
 
-    # Skip if already certified (config present in models/)
-    if [ -f "models/$SANITIZED.yaml" ]; then
-        echo "SKIP (already certified): $model"
-        continue
-    fi
+    # Skip only if already certified AND the model ID is unchanged.
+    # Reprofile when the config is missing, or when `ollama pull` delivered a
+    # new model version (different model ID) than the one the config was made for.
+    case "$(needs_profile "$model" "$SANITIZED")" in
+      same)   echo "SKIP (certified, model ID unchanged): $model"; continue ;;
+      absent) echo "SKIP (model not installed locally, keeping config): $model"; continue ;;
+    esac
 
     echo ""
     echo "--- [capture] $model ---"
@@ -99,11 +124,10 @@ for model in "${tool_models[@]}"; do
     CAP="adapter_profiler/workspace/captured_${SANITIZED}.json"
     MODEL_LOG="$LOG_DIR/$SANITIZED.log"
 
-    if [ -f "models/$SANITIZED.yaml" ]; then
-        echo "SKIP (already certified): $model"
-        success=$((success + 1))
-        continue
-    fi
+    case "$(needs_profile "$model" "$SANITIZED")" in
+      same)   echo "SKIP (certified, model ID unchanged): $model"; success=$((success + 1)); continue ;;
+      absent) echo "SKIP (model not installed locally, keeping config): $model"; success=$((success + 1)); continue ;;
+    esac
     if [ ! -f "$CAP" ]; then
         echo "SKIP (no capture): $model"
         fail=$((fail + 1))

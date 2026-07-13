@@ -11,8 +11,25 @@ where `adapter.py` loads them at runtime. No Ralph code changes needed for new m
 
 ### Phase 1 — Profile (Ralph runs)
 
+The profiling is driven by two scripts:
+
+- **`profile_all.sh`** — batch driver. Discovers every tool-capable model from
+  `ollama list` (skipping models that don't advertise the `tools` capability)
+  and profiles each one. See "Profiling workflow" below.
+- **`firstrun.sh <target> [brain]`** — single-model driver. Profiles one target
+  end-to-end (the brain defaults to `qwen2.5-coder:7b`).
+
+Each profiling run is itself **two-phase** to respect the single-model-in-VRAM
+rule:
+
+1. **Capture** — the *target* model runs alone (the brain is stopped first);
+   `profiler/generate_config.py` records 5 raw responses.
+2. **Replay** — the *brain* loads once and replays the captured responses,
+   writing/refining the YAML via `adapter_profiler/ralph.sh`.
+
 ```
-adapter_profiler/ralph.sh  →  profiler/generate_config.py  →  Ollama (target model)
+profiler/generate_config.py  →  Ollama (target model, capture-only)
+adapter_profiler/ralph.sh    →  Ollama (brain model, replay)
          │
          ▼
   workspace/<model>.yaml  ──promote──▶  models/<model>.yaml
@@ -122,7 +139,11 @@ normalizers:
 blocked: false
 ```
 
-Models with `blocked: true` are rejected at the adapter level — Ralph never sees their output.
+Models marked `blocked: true` (and annotated `unsupported: true`) could not emit
+tool calls the adapter can normalize. `adapter.py` **rejects** them at runtime:
+it prints `{"error": "model <name> is unsupported: no working adapter config"}`
+to stderr and exits with code 2 — so a request routed at a blocked model fails
+loudly instead of silently returning empty tool calls.
 
 ### `profiler/` — Test harness (called by Ralph)
 
@@ -162,6 +183,9 @@ autonomously profile target models and generate adapter configs.
 ./adapter_profiler/ralph.sh --target <model> [--model <brain>] [--verbose]
 ```
 
+This is the inner loop, normally invoked by `profile_all.sh` / `firstrun.sh`
+rather than run directly.
+
 Components:
 
 - **`ralph.sh`** — Main orchestrator. Manages a PID lock for single-instance
@@ -184,11 +208,61 @@ Components:
 - **`prompt.md`** — System prompt for the brain model. Contains the device-driver
   metaphor, troubleshooting decision tree, tool definitions, and output format rules.
 
-## Adding a new model
+## Profiling workflow
+
+### Automatic discovery
+
+`profile_all.sh` is the normal way to (re)build configs. It runs `ollama list`,
+keeps only models that advertise the `tools` capability (with a short retry so a
+transient `ollama show` failure never silently drops a model), and profiles each
+one. **New models are picked up automatically** — just `ollama pull` them first.
+
+### Re-profiling rule
+
+A model is (re)profiled when **either** condition holds:
+
+- there is **no** `models/<sanitized>.yaml` for it yet (a brand-new model), **or**
+- the model's current Ollama **`model_id`** differs from the `model_id` stored in
+  its config — i.e. `ollama pull` delivered a newer version of the model.
+
+If the config exists and the `model_id` still matches (the model is unchanged),
+the model is **skipped** (already certified). If the model isn't installed
+locally, its existing config is kept and it is skipped. This means a routine
+`ollama pull <model> && ./profile_all.sh` refreshes only what actually changed.
+
+The `model_id` is recorded in every config (e.g. `model_id: 4eb23ef187e2`) and is
+the 12-character hash `ollama list` reports for that tag.
+
+### Batch (all models)
+
+```bash
+./profile_all.sh
+```
+
+Runs the two-phase capture/replay for every tool-capable model, skipping
+already-certified ones. After it finishes, every certified model has a config in
+`models/` and a per-model log in `adapter_profiler/logs/<sanitized>.log`.
+
+### Single model
+
+```bash
+./firstrun.sh <target> [brain]      # e.g. ./firstrun.sh qwen3:8b
+```
+
+Profiles one target end-to-end and promotes its config. It applies the same
+skip rule as the batch driver; to force a re-profile of an unchanged model,
+delete its YAML first or set `FORCE=1`:
+
+```bash
+FORCE=1 ./firstrun.sh qwen3:8b
+```
+
+### Adding a new model
 
 1. Install via Ollama: `ollama pull new-model:tag`
-2. Run Ralph: `./adapter_profiler/ralph.sh --target new-model:tag`
-3. Ralph profiles the model, generates a config in `workspace/`, and promotes it to `models/`
+2. Run the batch driver (it auto-discovers the new model) or the single-model driver:
+   `./profile_all.sh`  _or_  `./firstrun.sh new-model:tag`
+3. The driver profiles the model, generates a config in `workspace/`, and promotes it to `models/`
 4. Verify: `python3 adapter.py --model new-model:tag --prompt test.txt`
 
 No changes to Ralph. No changes to the pipeline. Only a config file in `models/`.

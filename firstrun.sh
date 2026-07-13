@@ -21,6 +21,21 @@ SANITIZED="${TARGET//\//_}"
 SANITIZED="${SANITIZED//:/_}"
 CAP="adapter_profiler/workspace/captured_${SANITIZED}.json"
 
+# Skip if already certified and the model ID is unchanged, unless FORCE=1.
+if [ "${FORCE:-0}" != "1" ] && [ -f "models/$SANITIZED.yaml" ]; then
+  stored=$(grep -m1 '^model_id:' "models/$SANITIZED.yaml" | awk '{print $2}')
+  current=$(ollama list 2>/dev/null | awk -v m="$TARGET" '$1==m {id=$2} END {print id}')
+  if [ -n "$current" ] && [ "$current" = "$stored" ]; then
+    echo "SKIP (certified, model ID unchanged): $TARGET"
+    echo "  delete models/$SANITIZED.yaml or run: FORCE=1 ./firstrun.sh $TARGET"
+    exit 0
+  elif [ -z "$current" ]; then
+    echo "SKIP (model not installed locally, keeping config): $TARGET"
+    exit 0
+  fi
+  echo "REPROFILE (model ID changed): $TARGET"
+fi
+
 echo "🍾  Ralph adapter discovery — two-phase single-model run"
 echo "    target: $TARGET   brain: $BRAIN"
 echo
