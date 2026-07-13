@@ -1,0 +1,8 @@
+# Unsupported: this model (0.8b) is too small to emit tool calls the adapter
+# can normalize. Kept as a record of the failed attempt; the adapter entry is
+# disabled for this model.
+blocked: true
+unsupported: true
+model: qwen3.5:0.8b
+model_id: f3817196d142
+normalizers: []

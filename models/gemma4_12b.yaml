@@ -1,0 +1,8 @@
+# Unsupported: this model could not emit tool calls in any form the adapter
+# could normalize during profiling. Kept as a record of the failed attempt;
+# the adapter entry is disabled for this model.
+blocked: true
+unsupported: true
+model: gemma4:12b
+model_id: 4eb23ef187e2
+normalizers: []
