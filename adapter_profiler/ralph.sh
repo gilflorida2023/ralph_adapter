@@ -89,6 +89,7 @@ RALPH_START_EPOCH=$(date +%s)
 SANITIZED="${TARGET_MODEL//\//_}"
 SANITIZED="${SANITIZED//:/_}"
 sed "s|{target_model}|$TARGET_MODEL|g; s|{sanitized}|$SANITIZED|g" spec.md > workspace/spec_active.md
+sed "s|{target_model}|$TARGET_MODEL|g; s|{sanitized}|$SANITIZED|g" prompt.md > workspace/prompt_active.md
 python3 -c "
 import json
 tasks = [
@@ -135,6 +136,22 @@ if c and (pt or ct):
 print("================")
 PY
 }
+report_result() {
+    # $1 = status (done|blocked|failed)  $2 = reason
+    local status="$1"; local reason="$2"
+    {
+        echo "MODEL: $TARGET_MODEL"
+        echo "SANITIZED: $SANITIZED"
+        echo "RESULT: $status"
+        echo "REASON: $reason"
+        echo "ATTEMPTS: $ATT"
+    } | tee -a "$LOGFILE" > "workspace/report_${SANITIZED}.txt"
+    echo "=== RESULT: $status ($reason) ===" | tee -a "$LOGFILE"
+}
+
+# Fail-fast ceiling: stop well before the absolute MAX_ATTEMPTS loop bound.
+FAILFAST_ATTEMPTS=12
+
 trap 'print_summary; cleanup_lock' EXIT
 
 echo "=== Starting Adapter Profiler Loop ===" | tee -a "$LOGFILE"
@@ -162,7 +179,7 @@ task_title = sys.argv[2]
 target = os.environ.get('RALPH_TARGET_MODEL', '')
 sanitized = target.replace('/', '_').replace(':', '_')
 
-with open('prompt.md') as f:
+with open('workspace/prompt_active.md') as f:
     system = f.read().strip()
 with open('workspace/spec_active.md') as f:
     spec = f.read().strip()
@@ -199,6 +216,12 @@ PY
     MAX_ATTEMPTS=30
     ATT=0
     TASK_DONE=false
+    FINAL_STATUS="failed"
+    FINAL_REASON=""
+    BLOCKED_CONSEC=0
+    YAML_LAST_MD5=""
+    YAML_STUCK=0
+
     while [ "$ATT" -lt "$MAX_ATTEMPTS" ] && [ "$TASK_DONE" != "true" ]; do
         ATT=$((ATT + 1))
 
@@ -256,6 +279,9 @@ log_lines = []
 
 raw = raw.strip().replace('```json', '').replace('```', '').strip()
 
+# Always log a preview of what the brain returned, so every attempt is visible
+log_lines.append(f"BRAIN RAW: {raw[:300]}")
+
 try:
     data = json.loads(raw)
 except:
@@ -283,6 +309,13 @@ for c in calls:
         name = 'run_command'
     args = c.get('args') or c.get('parameters') or {}
     result.append({'name': name, 'args': args})
+
+# If nothing was parsed, make that explicit so the log is never silent
+if not result:
+    msg = "NO TOOL CALLS parsed from brain response (valid JSON but missing/empty tool_calls)"
+    print(msg)
+    log_lines.append(msg)
+    log_lines.append(f"RAW PREVIEW: {raw[:200]}")
 
 ALLOWED = {'read_file', 'write_file', 'run_command', 'mark_task'}
 for c in result:
@@ -323,7 +356,57 @@ PY
         # Check if task was marked done/blocked
         if grep -q "\[DONE\] Task $TASK_NUM:" workspace/progress.md 2>/dev/null || \
            grep -q "\[BLOCKED\] Task $TASK_NUM:" workspace/progress.md 2>/dev/null; then
-            echo "=== Task $TASK_NUM marked ===" | tee -a "$LOGFILE"
+            if grep -q "\[DONE\] Task $TASK_NUM:" workspace/progress.md 2>/dev/null; then
+                FINAL_STATUS="done"; FINAL_REASON="all tests passed"
+            else
+                FINAL_STATUS="blocked"; FINAL_REASON="mark_task blocked"
+            fi
+            echo "=== Task $TASK_NUM marked ($FINAL_STATUS) ===" | tee -a "$LOGFILE"
+            TASK_DONE=true
+            continue
+        fi
+
+        # --- Fail-fast guards (prevent infinite loops) ---
+
+        # (a) Blocked fast-path: if the submitted YAML keeps asserting blocked,
+        #     it has already been confirmed once — stop re-looping.
+        if [ -f "workspace/${SANITIZED}.yaml" ] && grep -qE "^blocked:[[:space:]]*true" "workspace/${SANITIZED}.yaml"; then
+            BLOCKED_CONSEC=$((BLOCKED_CONSEC + 1))
+        else
+            BLOCKED_CONSEC=0
+        fi
+        if [ "$BLOCKED_CONSEC" -ge 2 ]; then
+            echo "=== Fail-fast: blocked:true submitted $BLOCKED_CONSEC consecutive attempts — stopping ===" | tee -a "$LOGFILE"
+            python3 agent.py execute mark_task "{\"num\":$TASK_NUM,\"state\":\"blocked\"}" >> "$LOGFILE" 2>&1
+            FINAL_STATUS="blocked"; FINAL_REASON="blocked:true confirmed on consecutive attempts"
+            TASK_DONE=true
+            continue
+        fi
+
+        # (b) No-progress detector: if ralph stops changing its YAML and isn't
+        #     marking done, it is stuck — fail fast rather than loop forever.
+        if [ -f "workspace/${SANITIZED}.yaml" ]; then
+            YAML_MD5=$(md5sum "workspace/${SANITIZED}.yaml" | awk '{print $1}')
+            if [ "$YAML_MD5" = "$YAML_LAST_MD5" ]; then
+                YAML_STUCK=$((YAML_STUCK + 1))
+            else
+                YAML_STUCK=0
+                YAML_LAST_MD5="$YAML_MD5"
+            fi
+            if [ "$YAML_STUCK" -ge 3 ]; then
+                echo "=== Fail-fast: YAML unchanged for $YAML_STUCK consecutive attempts — no progress, stopping ===" | tee -a "$LOGFILE"
+                python3 agent.py execute mark_task "{\"num\":$TASK_NUM,\"state\":\"blocked\"}" >> "$LOGFILE" 2>&1
+                FINAL_STATUS="blocked"; FINAL_REASON="no YAML change / no progress for consecutive attempts"
+                TASK_DONE=true
+                continue
+            fi
+        fi
+
+        # (c) Hard ceiling: never run past FAILFAST_ATTEMPTS without completion.
+        if [ "$ATT" -ge "$FAILFAST_ATTEMPTS" ]; then
+            echo "=== Fail-fast: reached $FAILFAST_ATTEMPTS attempts without completion — stopping ===" | tee -a "$LOGFILE"
+            python3 agent.py execute mark_task "{\"num\":$TASK_NUM,\"state\":\"blocked\"}" >> "$LOGFILE" 2>&1
+            FINAL_STATUS="blocked"; FINAL_REASON="exhausted fail-fast attempt ceiling ($FAILFAST_ATTEMPTS)"
             TASK_DONE=true
             continue
         fi
@@ -351,13 +434,24 @@ with open('/tmp/ralph_prompt.txt', 'a') as f:
     f.write("Analyze the RAW output shown above for each test.\n")
     f.write("Refer to the decision tree in the Troubleshooting Guide.\n")
     f.write("Then:\n")
-    f.write("- If raw output shows formatting issues (fences, quotes, top keys) → write_file to update workspace/{sanitized}.yaml with normalizers, then re-run profiler\n")
-    f.write("- If raw output is empty or has wrong tool names → model is too limited. Set blocked: true in the YAML and call mark_task\n")
-    f.write("- If all 5 PASS → call mark_task with state='done'\n")
+    f.write("- If you see jq '.tool_calls' ERROR for any test → the YAML's normalizers produced invalid JSON. Fix workspace/{sanitized}.yaml (add/remove normalizers) and re-run the evaluator.\n")
+    f.write("- If a test shows jq '.tool_calls' => [] (no tool calls) → model/format issue. Adjust normalizers or, if the model truly can't emit tool calls, set blocked: true in the YAML and call mark_task.\n")
+    f.write("- If all tests show valid tool_calls with no jq errors → call mark_task with state='done'\n")
+
+    # Always re-attach the submitted YAML source so ralph sees its own
+    # source paired with the jq feedback from the previous attempt.
+    yaml_path = f"workspace/{sanitized}.yaml"
+    if os.path.isfile(yaml_path):
+        with open(yaml_path) as yf:
+            src = yf.read().strip()
+        f.write(f"\n=== Your submitted YAML source (workspace/{sanitized}.yaml) ===\n")
+        f.write(src + "\n")
+        f.write("=== END submitted YAML source ===\n")
 PY
         fi
         sleep 1
     done
 done
 
+report_result "$FINAL_STATUS" "$FINAL_REASON"
 echo "=== Ralph adapter profiler loop ended ===" | tee -a "$LOGFILE"

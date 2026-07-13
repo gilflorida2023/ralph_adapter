@@ -132,7 +132,7 @@ def gather_raw_responses(model_name, max_time=300, temperature=0.0):
             print(f"--- {tc['name']} (0 bytes) ---")
             print("raw = ''")
             print()
-            print("jq: echo '' | jq '.tool_calls'")
+            run_jq_tool_calls("")
             print(f"Error: {last_error}")
             print("HINT: model returned empty response — too small or doesn't understand tool calling")
             print("STATUS: FAIL")
@@ -143,6 +143,33 @@ def gather_raw_responses(model_name, max_time=300, temperature=0.0):
         responses[tc["name"]] = raw_content
 
     return responses
+
+
+def run_jq_tool_calls(raw_content):
+    """Actually run `jq '.tool_calls'` against the raw model output and show the result.
+
+    Prints the real jq output (or the jq error) so the diagnostic is actionable
+    instead of just a suggested command.
+    """
+    try:
+        proc = subprocess.run(
+            ["jq", ".tool_calls"],
+            input=raw_content,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            print("jq '.tool_calls' =>")
+            print(proc.stdout.rstrip())
+        else:
+            print("jq '.tool_calls' ERROR:")
+            print(proc.stderr.strip())
+    except FileNotFoundError:
+        print("jq: command not found (install jq to see parsed output)")
+    except subprocess.TimeoutExpired:
+        print("jq: timed out")
+    print()
 
 
 def analyze_responses(model_name, responses, output_dir=None, temperature=0.0):
@@ -163,7 +190,7 @@ def analyze_responses(model_name, responses, output_dir=None, temperature=0.0):
             print(f"--- {tc['name']} (0 bytes) ---")
             print("raw = ''")
             print()
-            print("jq: echo '' | jq '.tool_calls'")
+            run_jq_tool_calls("")
             print("Error: empty captured response")
             print("HINT: model returned empty response — too small or doesn't understand tool calling")
             print("STATUS: FAIL")
@@ -205,18 +232,18 @@ def analyze_responses(model_name, responses, output_dir=None, temperature=0.0):
 
         # Compiler-style parse attempt
         if not raw_content.strip():
-            print("jq: echo '' | jq '.tool_calls'")
+            run_jq_tool_calls("")
             print("Error: empty response from model")
             print("HINT: model returned nothing — too small or doesn't support tools")
         elif not is_valid:
-            print(f"jq: echo {raw_repr} | jq '.tool_calls'")
+            run_jq_tool_calls(raw_content)
             print("Error: not valid JSON")
             if has_fences:
                 print("HINT: model wrapped output in markdown fences — add 'strip_markdown_fences'")
             if quote_wrap:
                 print("HINT: model wrapped output in quotes — add 'unwrap_json_string'")
         elif tc_count == 0 and not has_tc:
-            print(f"jq: echo {raw_repr} | jq '.tool_calls'")
+            run_jq_tool_calls(raw_content)
             print("Error: JSON has no 'tool_calls' key")
             if top_tools:
                 print(f"HINT: found tools at root level ({top_tools}) — add 'merge_top_level_keys'")

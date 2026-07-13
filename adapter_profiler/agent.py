@@ -175,6 +175,9 @@ def execute_run_command(args):
 
 def execute_mark_task(args):
     num = int(args.get("num", 0))
+    # There is always exactly one profiling task (num 1); tolerate a missing/0 num.
+    if num == 0:
+        num = 1
     state = args.get("state", "done")
     result = update_progress_file(num, state)
     if "ERROR" in result:

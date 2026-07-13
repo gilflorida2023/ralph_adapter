@@ -1,6 +1,8 @@
 model: satgeze/gemma4-12b-uncensored-1.5m:latest
+model_id: 4eabc5be7dfb
 normalizers:
   - strip_markdown_fences
   - unwrap_json_string
   - merge_top_level_keys
   - trim_trailing_garbage
+blocked: false
